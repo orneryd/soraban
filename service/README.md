@@ -89,18 +89,18 @@ before adapters start.
 
 ### 4.2 Environment
 
-| Variable | Default | Used by |
-| --- | --- | --- |
-| `DATABASE_URL` | local restricted-role DSN from the PostgreSQL spec | all commands |
-| `IRS_BASE_URL` | `http://127.0.0.1:8081` | `worker` |
-| `IRS_BEARER_TOKEN` | `local-irs-token` | `worker` |
-| `HTTP_ADDR` | `127.0.0.1:8080` | `serve` |
-| `WORKER_IDLE_DELAY` | `1s` | `worker` |
-| `WORKER_LEASE_DURATION` | `30s` | `worker` |
-| `HTTP_CONNECT_TIMEOUT` | `3s` | `worker` |
-| `HTTP_RESPONSE_HEADER_TIMEOUT` | `5s` | `worker` |
-| `HTTP_TOTAL_TIMEOUT` | `10s` | `worker` |
-| `SHUTDOWN_TIMEOUT` | `15s` | `worker`, `serve` |
+| Variable                       | Default                                            | Used by           |
+| ------------------------------ | -------------------------------------------------- | ----------------- |
+| `DATABASE_URL`                 | local restricted-role DSN from the PostgreSQL spec | all commands      |
+| `IRS_BASE_URL`                 | `http://127.0.0.1:8081`                            | `worker`          |
+| `IRS_BEARER_TOKEN`             | `local-irs-token`                                  | `worker`          |
+| `HTTP_ADDR`                    | `127.0.0.1:8080`                                   | `serve`           |
+| `WORKER_IDLE_DELAY`            | `1s`                                               | `worker`          |
+| `WORKER_LEASE_DURATION`        | `30s`                                              | `worker`          |
+| `HTTP_CONNECT_TIMEOUT`         | `3s`                                               | `worker`          |
+| `HTTP_RESPONSE_HEADER_TIMEOUT` | `5s`                                               | `worker`          |
+| `HTTP_TOTAL_TIMEOUT`           | `10s`                                              | `worker`          |
+| `SHUTDOWN_TIMEOUT`             | `15s`                                              | `worker`, `serve` |
 
 The lease duration MUST exceed the total HTTP timeout plus a bounded persistence
 margin. Secrets MUST come from environment or an injected configuration source,
@@ -132,7 +132,36 @@ and requires exactly one match for the selected firm/year. Zero or multiple
 matches are an operator-visible error; revised exports are out of scope.
 Symlinks MUST NOT be followed implicitly.
 
-### 5.2 Streaming reader
+### 5.2 Supplied real-data fixtures
+
+Both required generated exports are checked into the repository under `data/`:
+
+| Firm   | Repository-relative fixture path | Compressed SHA-256                                                 |
+| ------ | -------------------------------- | ------------------------------------------------------------------ |
+| `F001` | `data/firm_F001_export.csv.gz`   | `229ac7223dc4e316e6fed52644b793899c0f0c34b33084453e364e68ec1ea29c` |
+| `F002` | `data/firm_F002_export.csv.gz`   | `09668327e446544c1e0fe1430dbe859838bfbb64ef0381c57f17ffd2d06f7e71` |
+
+The mapping is explicit: the F001 path is imported with `--firm F001`, and the
+F002 path with `--firm F002`. Tests MUST NOT infer firm identity from the
+filename or CSV contents.
+
+E2E and performance targets MUST resolve these paths from the repository root,
+not the process working directory or an absolute machine path. They MUST fail
+with a useful prerequisite error when either checked-in fixture is absent or its
+compressed checksum differs; they MUST NOT generate replacement business data
+silently. Dataset idempotency continues to use the required decompressed-stream
+hash.
+
+The final CLI must support these direct runs:
+
+```sh
+readiness import --firm F001 --tax-year 2025 \
+  --input data/firm_F001_export.csv.gz
+readiness import --firm F002 --tax-year 2025 \
+  --input data/firm_F002_export.csv.gz
+```
+
+### 5.3 Streaming reader
 
 For one source file, the importer MUST:
 
@@ -156,7 +185,7 @@ Transport validation belongs here. Money, date, method, TIN, and withholding
 business validation remains in the PostgreSQL lifecycle import so it is enforced
 inside the atomic database transaction.
 
-### 5.3 Import orchestration
+### 5.4 Import orchestration
 
 The import command passes the stream directly to `ImportDataset`. It MUST NOT
 materialize all rows. A matching replay is success and reports `Existing=true`.
@@ -225,28 +254,28 @@ worker claim recovers from durable state.
 
 ### 8.2 Action mapping
 
-| `BatchWork.NextAction` | IRS operation | Allowed lifecycle result |
-| --- | --- | --- |
-| `submit` | Intake using stable canonical XML | `RecordSubmitAccepted`, `RecordSubmitUnknown`, or `FailBatchInvariant` |
-| `lookup_by_utid` | Status by stable UTID | `RecordReferenceFound`, `RecordReferenceNotFound`, `RecordStatusUnavailable`, or `FailBatchInvariant` |
-| `poll_status` | Status by ReceiptId, falling back to UTID only when ReceiptId is absent | `RecordAcknowledgmentPending`, `CompleteAcknowledgment`, `RecordStatusUnavailable`, or `FailBatchInvariant` |
+| `BatchWork.NextAction` | IRS operation                                                           | Allowed lifecycle result                                                                                    |
+| ---------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `submit`               | Intake using stable canonical XML                                       | `RecordSubmitAccepted`, `RecordSubmitUnknown`, or `FailBatchInvariant`                                      |
+| `lookup_by_utid`       | Status by stable UTID                                                   | `RecordReferenceFound`, `RecordReferenceNotFound`, `RecordStatusUnavailable`, or `FailBatchInvariant`       |
+| `poll_status`          | Status by ReceiptId, falling back to UTID only when ReceiptId is absent | `RecordAcknowledgmentPending`, `CompleteAcknowledgment`, `RecordStatusUnavailable`, or `FailBatchInvariant` |
 
 Unknown actions are invariant failures and cause no HTTP call.
 
 ### 8.3 Outcome mapping
 
-| Context | Observed result | Permit outcome | Lifecycle call |
-| --- | --- | --- | --- |
-| Submit | `200` with one ReceiptId | `completed` | `RecordSubmitAccepted` |
-| Submit | transport error, `5xx`, or `429` | `ambiguous` | `RecordSubmitUnknown` |
-| Submit | `409 DUPLICATE_UTID` | `completed` | `RecordSubmitUnknown` |
-| Submit | `400`, `401`, `415`, `409 DUPLICATE_RECORD`, malformed response | `terminal_error` | `FailBatchInvariant` |
-| UTID lookup | `200` found | `completed` | `RecordReferenceFound` |
-| UTID lookup | `404 NOT_FOUND` | `completed` | `RecordReferenceNotFound` |
-| Lookup or poll | transport error, `5xx`, or `429` | `retryable_error` | `RecordStatusUnavailable` |
-| Poll | `200 Processing` | `completed` | `RecordAcknowledgmentPending` |
-| Poll | completed per-filing results | `completed` | `CompleteAcknowledgment` |
-| Lookup or poll | authentication, invalid request, identity mismatch, malformed or incomplete result set | `terminal_error` | `FailBatchInvariant` |
+| Context        | Observed result                                                                        | Permit outcome    | Lifecycle call                |
+| -------------- | -------------------------------------------------------------------------------------- | ----------------- | ----------------------------- |
+| Submit         | `200` with one ReceiptId                                                               | `completed`       | `RecordSubmitAccepted`        |
+| Submit         | transport error, `5xx`, or `429`                                                       | `ambiguous`       | `RecordSubmitUnknown`         |
+| Submit         | `409 DUPLICATE_UTID`                                                                   | `completed`       | `RecordSubmitUnknown`         |
+| Submit         | `400`, `401`, `415`, `409 DUPLICATE_RECORD`, malformed response                        | `terminal_error`  | `FailBatchInvariant`          |
+| UTID lookup    | `200` found                                                                            | `completed`       | `RecordReferenceFound`        |
+| UTID lookup    | `404 NOT_FOUND`                                                                        | `completed`       | `RecordReferenceNotFound`     |
+| Lookup or poll | transport error, `5xx`, or `429`                                                       | `retryable_error` | `RecordStatusUnavailable`     |
+| Poll           | `200 Processing`                                                                       | `completed`       | `RecordAcknowledgmentPending` |
+| Poll           | completed per-filing results                                                           | `completed`       | `CompleteAcknowledgment`      |
+| Lookup or poll | authentication, invalid request, identity mismatch, malformed or incomplete result set | `terminal_error`  | `FailBatchInvariant`          |
 
 A submit ambiguity always becomes UTID lookup. It never schedules another submit
 directly. A stale pending acknowledgment remains pollable and is never
@@ -313,16 +342,16 @@ DSNs, credentials, raw UTIDs, canonical XML, TINs, names, memos, or source rows.
 
 ### 11.1 Unit and adapter tests
 
-| Test | Required proof |
-| --- | --- |
-| `TEST-SVC-STARTUP-01` | Each command validates only required configuration, composes adapters, and fails on lifecycle open/schema errors. |
-| `TEST-SVC-IMPORT-01` | Discovery, gzip errors, exact header, UTF-8, CSV quoting/newlines, row numbers, bounded record size, cancellation, and decompressed hash are exact. |
-| `TEST-SVC-ORCHESTRATE-01` | Fake lifecycle proves import, determination, and planning order, replay handling, and error mapping without PostgreSQL. |
-| `TEST-SVC-IRSCLIENT-01` | `httptest.Server` verifies paths, headers, multipart bytes, lookup XML, response limits, and strict decoding. |
-| `TEST-SVC-WORKER-01` | Fake lifecycle plus recording transport maps every action/outcome row in Section 8 and performs at most one HTTP call per permit. |
-| `TEST-SVC-RATE-01` | Worker always finishes/closes permits on success, transport failure, decode failure, cancellation, and panic-safe cleanup paths. |
-| `TEST-SVC-STATUS-01` | HTTP handlers render only lifecycle query results and preserve headline precedence and counts. |
-| `TEST-SVC-SHUTDOWN-01` | Shutdown stops claims, cancels waits/HTTP, permits bounded persistence, and exits within its deadline. |
+| Test                      | Required proof                                                                                                                                      |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TEST-SVC-STARTUP-01`     | Each command validates only required configuration, composes adapters, and fails on lifecycle open/schema errors.                                   |
+| `TEST-SVC-IMPORT-01`      | Discovery, gzip errors, exact header, UTF-8, CSV quoting/newlines, row numbers, bounded record size, cancellation, and decompressed hash are exact. |
+| `TEST-SVC-ORCHESTRATE-01` | Fake lifecycle proves import, determination, and planning order, replay handling, and error mapping without PostgreSQL.                             |
+| `TEST-SVC-IRSCLIENT-01`   | `httptest.Server` verifies paths, headers, multipart bytes, lookup XML, response limits, and strict decoding.                                       |
+| `TEST-SVC-WORKER-01`      | Fake lifecycle plus recording transport maps every action/outcome row in Section 8 and performs at most one HTTP call per permit.                   |
+| `TEST-SVC-RATE-01`        | Worker always finishes/closes permits on success, transport failure, decode failure, cancellation, and panic-safe cleanup paths.                    |
+| `TEST-SVC-STATUS-01`      | HTTP handlers render only lifecycle query results and preserve headline precedence and counts.                                                      |
+| `TEST-SVC-SHUTDOWN-01`    | Shutdown stops claims, cancels waits/HTTP, permits bounded persistence, and exits within its deadline.                                              |
 
 Unit tests MUST use fakes and `httptest`; they MUST NOT require PostgreSQL or the
 IRS stub. Fuzz tests cover CSV quoting/newlines, XML decoding, and outcome mapping.
@@ -332,7 +361,12 @@ IRS stub. Fuzz tests cover CSV quoting/newlines, XML decoding, and outcome mappi
 E2E tests use the restricted PostgreSQL role and the IRS stub only through HTTP.
 They MUST include:
 
-- import through the real gzip/CSV adapter into PostgreSQL;
+- import `data/firm_F001_export.csv.gz` and
+  `data/firm_F002_export.csv.gz` through the real gzip/CSV adapter into
+  PostgreSQL, asserting their exact firm mapping and resulting source row
+  counts;
+- replay each supplied file and prove dataset/payment counts and values are
+  unchanged;
 - determination, batch planning, worker submission, delayed acknowledgment, and
   final status through service entry points;
 - default live-stub operation at `http://127.0.0.1:8081`;
@@ -343,8 +377,10 @@ They MUST include:
 - durable call-log verification of at most 20 calls in every rolling 60 seconds
   per firm.
 
-Performance tests use the supplied exports and record machine details, import
-wall time, determination wall time, status p95, and 1x/4x peak RSS.
+Performance tests use both supplied fixture paths and record machine details,
+per-file import wall time, combined determination wall time, status p95, and
+1x/4x peak RSS. Each full firm import MUST complete in under 120 seconds and the
+combined determination in under 60 seconds on the documented machine.
 
 ## 12. Definition of done
 
