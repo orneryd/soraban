@@ -2,14 +2,15 @@
 
 Status: Draft
 Date: 2026-08-30
-Companion: [Formal draft specification](formal-draft-spec.md)
+Companions: [Formal draft specification](formal-draft-spec.md) and
+[PostgreSQL data model specification](postgres-data-model-spec.md)
 
 ## 1. Decision summary
 
 Build the application in Go with PostgreSQL and `pgx`. Use ordinary PostgreSQL
 tables for source facts, determinations, the transactional outbox, worker leases,
-rate accounting, acknowledgments, and status. Keep the IRS stub in a separate
-PostgreSQL database and communicate with it only over HTTP.
+rate accounting, acknowledgments, and status. Keep the existing in-memory IRS
+stub in a separate process and communicate with it only over HTTP.
 
 This is the smallest design found that offers all required primitives without
 adding a second consistency system:
@@ -32,15 +33,15 @@ ambiguous outcome.
 
 ## 2. Database evaluation
 
-| Candidate | License posture | Fit | Decision |
-| --- | --- | --- | --- |
-| PostgreSQL | PostgreSQL License, permissive | Native `COPY`, constraints, RLS, advisory locks, `SKIP LOCKED`, partial indexes, strong transactions | Select |
-| SQLite | Public domain | Excellent embedded database, but serialized writes and no `SKIP LOCKED` make multi-worker/rate-gate coordination awkward | Reject |
-| MySQL/MariaDB | GPL family | Capable SQL databases, but fail a strict permissive-only runtime policy | Reject |
-| CockroachDB | Source-available and enterprise licensing applies to current distributions | Distributed SQL is unnecessary and licensing is outside the allowlist | Reject |
-| YugabyteDB | Apache-2.0 core | Permissive core but materially more operational surface than this local project needs | Reject |
-| FoundationDB | Apache-2.0 | Strong transactional substrate but would require rebuilding SQL/data-access features already present in PostgreSQL | Reject |
-| Redis | Current licensing includes AGPL/source-available choices depending release | Adds another durable system and is unnecessary for this queue | Reject |
+| Candidate     | License posture                                                            | Fit                                                                                                                      | Decision |
+| ------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------- |
+| PostgreSQL    | PostgreSQL License, permissive                                             | Native `COPY`, constraints, RLS, advisory locks, `SKIP LOCKED`, partial indexes, strong transactions                     | Select   |
+| SQLite        | Public domain                                                              | Excellent embedded database, but serialized writes and no `SKIP LOCKED` make multi-worker/rate-gate coordination awkward | Reject   |
+| MySQL/MariaDB | GPL family                                                                 | Capable SQL databases, but fail a strict permissive-only runtime policy                                                  | Reject   |
+| CockroachDB   | Source-available and enterprise licensing applies to current distributions | Distributed SQL is unnecessary and licensing is outside the allowlist                                                    | Reject   |
+| YugabyteDB    | Apache-2.0 core                                                            | Permissive core but materially more operational surface than this local project needs                                    | Reject   |
+| FoundationDB  | Apache-2.0                                                                 | Strong transactional substrate but would require rebuilding SQL/data-access features already present in PostgreSQL       | Reject   |
+| Redis         | Current licensing includes AGPL/source-available choices depending release | Adds another durable system and is unnecessary for this queue                                                            | Reject   |
 
 PostgreSQL is not selected merely because it can act as a queue. It is selected
 because the work item and the business state it represents can be committed in
@@ -51,16 +52,16 @@ boundary nor the local atomicity proof.
 
 The following official documentation controls implementation details:
 
-| Primitive | Relevant conclusion | Source |
-| --- | --- | --- |
-| `COPY` | `COPY FROM` moves rows from a stream into a table; pgx exposes the protocol without retaining the full file | [PostgreSQL COPY](https://www.postgresql.org/docs/current/sql-copy.html) |
-| Row locking | `SKIP LOCKED` gives an inconsistent view unsuitable for ordinary queries but explicitly suits queue-like consumers | [PostgreSQL SELECT locking clause](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE) |
-| Partial indexes | A due-work index can exclude terminal rows and reduce write/index cost | [PostgreSQL partial indexes](https://www.postgresql.org/docs/current/indexes-partial.html) |
-| Advisory locks | Application-defined locks can serialize one firm's rate gate across processes | [PostgreSQL advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS) |
-| RLS | Enabled tables default-deny without a policy; owners normally bypass unless row security is forced | [PostgreSQL row security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html) |
-| RLS and `COPY` | `COPY FROM` is not supported for tables with row-level security enabled | [PostgreSQL COPY notes](https://www.postgresql.org/docs/current/sql-copy.html#SQL-COPY-NOTES) |
-| Durability | `fsync`, `full_page_writes`, and synchronous commit settings define acknowledged-commit durability | [PostgreSQL WAL reliability](https://www.postgresql.org/docs/current/wal-reliability.html) |
-| Numeric exactness | Integer types are exact and suit cents without decimal parsing ambiguity | [PostgreSQL numeric types](https://www.postgresql.org/docs/current/datatype-numeric.html) |
+| Primitive         | Relevant conclusion                                                                                                | Source                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `COPY`            | `COPY FROM` moves rows from a stream into a table; pgx exposes the protocol without retaining the full file        | [PostgreSQL COPY](https://www.postgresql.org/docs/current/sql-copy.html)                                         |
+| Row locking       | `SKIP LOCKED` gives an inconsistent view unsuitable for ordinary queries but explicitly suits queue-like consumers | [PostgreSQL SELECT locking clause](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE) |
+| Partial indexes   | A due-work index can exclude terminal rows and reduce write/index cost                                             | [PostgreSQL partial indexes](https://www.postgresql.org/docs/current/indexes-partial.html)                       |
+| Advisory locks    | Application-defined locks can serialize one firm's rate gate across processes                                      | [PostgreSQL advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)        |
+| RLS               | Enabled tables default-deny without a policy; owners normally bypass unless row security is forced                 | [PostgreSQL row security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)                          |
+| RLS and `COPY`    | `COPY FROM` is not supported for tables with row-level security enabled                                            | [PostgreSQL COPY notes](https://www.postgresql.org/docs/current/sql-copy.html#SQL-COPY-NOTES)                    |
+| Durability        | `fsync`, `full_page_writes`, and synchronous commit settings define acknowledged-commit durability                 | [PostgreSQL WAL reliability](https://www.postgresql.org/docs/current/wal-reliability.html)                       |
+| Numeric exactness | Integer types are exact and suit cents without decimal parsing ambiguity                                           | [PostgreSQL numeric types](https://www.postgresql.org/docs/current/datatype-numeric.html)                        |
 
 Two cautions shape the design:
 
@@ -75,12 +76,12 @@ Two cautions shape the design:
 The survey used maintained projects' live schemas to avoid inventing queue
 metadata from memory. Their code is not copied and none is a runtime dependency.
 
-| Project | Useful schema lessons | License / decision | Source |
-| --- | --- | --- | --- |
-| River | Explicit states, attempts, scheduling/finalization times, uniqueness metadata, appendable errors, and indexes specialized by runnable state | MPL-2.0; reject under strict permissive-only policy | [River repository](https://github.com/riverqueue/river), [license](https://github.com/riverqueue/river/blob/master/LICENSE) |
-| Graphile Worker | Database functions claim jobs atomically; rows include run time, attempt limits, lock owner/time, queue identity, and deduplication key | MIT; reference only because application is Go | [Graphile Worker schema](https://github.com/graphile/worker/tree/main/src/generated/sql), [license](https://github.com/graphile/worker/blob/main/LICENSE.md) |
-| pg-boss | Retry/backoff, expiration, singleton/debounce keys, archive strategy, and explicit job states are durable row metadata | MIT; reference only because application is Go | [pg-boss repository](https://github.com/timgit/pg-boss), [license](https://github.com/timgit/pg-boss/blob/master/LICENSE) |
-| Que | Priority/run time, error history, and advisory-lock coordination demonstrate a small PostgreSQL-backed queue | MIT; reference only because application is Go | [Que repository](https://github.com/que-rb/que), [license](https://github.com/que-rb/que/blob/master/LICENSE.txt) |
+| Project         | Useful schema lessons                                                                                                                       | License / decision                                  | Source                                                                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| River           | Explicit states, attempts, scheduling/finalization times, uniqueness metadata, appendable errors, and indexes specialized by runnable state | MPL-2.0; reject under strict permissive-only policy | [River repository](https://github.com/riverqueue/river), [license](https://github.com/riverqueue/river/blob/master/LICENSE)                                  |
+| Graphile Worker | Database functions claim jobs atomically; rows include run time, attempt limits, lock owner/time, queue identity, and deduplication key     | MIT; reference only because application is Go       | [Graphile Worker schema](https://github.com/graphile/worker/tree/main/src/generated/sql), [license](https://github.com/graphile/worker/blob/main/LICENSE.md) |
+| pg-boss         | Retry/backoff, expiration, singleton/debounce keys, archive strategy, and explicit job states are durable row metadata                      | MIT; reference only because application is Go       | [pg-boss repository](https://github.com/timgit/pg-boss), [license](https://github.com/timgit/pg-boss/blob/master/LICENSE)                                    |
+| Que             | Priority/run time, error history, and advisory-lock coordination demonstrate a small PostgreSQL-backed queue                                | MIT; reference only because application is Go       | [Que repository](https://github.com/que-rb/que), [license](https://github.com/que-rb/que/blob/master/LICENSE.txt)                                            |
 
 The local schema deliberately omits generic-queue features that the filing state
 machine does not use: arbitrary task names, generic JSON arguments, cron,
@@ -145,27 +146,27 @@ The International Journal on Very Large Data Bases, 2025,
 
 ## 6. Job and workflow alternatives
 
-| Alternative | License | Why it is not selected |
-| --- | --- | --- |
-| River | MPL-2.0 | Good Go/PostgreSQL fit, but file-level copyleft violates the requested strict permissive stack. |
-| Temporal | MIT for open-source server and Go SDK | Operationally large for four explicit batch states; remote activities still need idempotency. |
-| DBOS | Permissive open-source SDKs vary by package | No framework can make a nontransactional IRS side effect atomic; unnecessary abstraction for this state machine. |
-| Kafka | Apache-2.0 | Adds brokers and an event-log consistency model while local intent already lives transactionally in PostgreSQL. |
-| Graphile Worker | MIT | Strong PostgreSQL design, but TypeScript runtime mismatch and generic queue features are unnecessary. |
-| pg-boss | MIT | Same reasoning as Graphile Worker. |
-| Que | MIT | Ruby runtime mismatch; Rails was only a preference, not a requirement. |
+| Alternative     | License                                     | Why it is not selected                                                                                           |
+| --------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| River           | MPL-2.0                                     | Good Go/PostgreSQL fit, but file-level copyleft violates the requested strict permissive stack.                  |
+| Temporal        | MIT for open-source server and Go SDK       | Operationally large for four explicit batch states; remote activities still need idempotency.                    |
+| DBOS            | Permissive open-source SDKs vary by package | No framework can make a nontransactional IRS side effect atomic; unnecessary abstraction for this state machine. |
+| Kafka           | Apache-2.0                                  | Adds brokers and an event-log consistency model while local intent already lives transactionally in PostgreSQL.  |
+| Graphile Worker | MIT                                         | Strong PostgreSQL design, but TypeScript runtime mismatch and generic queue features are unnecessary.            |
+| pg-boss         | MIT                                         | Same reasoning as Graphile Worker.                                                                               |
+| Que             | MIT                                         | Ruby runtime mismatch; Rails was only a preference, not a requirement.                                           |
 
 Handwritten SQL is not a commitment to build a general queue. It is a commitment
 to implement only the filing state transitions named in the specification.
 
 ## 7. Selected dependency license matrix
 
-| Component | Use | License | Policy result |
-| --- | --- | --- | --- |
-| Go toolchain and standard library | Application language/runtime | BSD-3-Clause | Allow |
-| PostgreSQL | Application and stub databases, `psql` migration runner | PostgreSQL License | Allow |
-| `github.com/jackc/pgx/v5` | PostgreSQL driver, pool, and streaming COPY | MIT | Allow |
-| Project-owned Go/SQL/HTML/CSS | Product code | Repository license to be chosen | No third-party restriction |
+| Component                         | Use                                              | License                         | Policy result              |
+| --------------------------------- | ------------------------------------------------ | ------------------------------- | -------------------------- |
+| Go toolchain and standard library | Application language/runtime                     | BSD-3-Clause                    | Allow                      |
+| PostgreSQL                        | Application database and `psql` migration runner | PostgreSQL License              | Allow                      |
+| `github.com/jackc/pgx/v5`         | PostgreSQL driver, pool, and streaming COPY      | MIT                             | Allow                      |
+| Project-owned Go/SQL/HTML/CSS     | Product code                                     | Repository license to be chosen | No third-party restriction |
 
 Sources:
 
@@ -208,12 +209,14 @@ not shipped merely because their license is acceptable.
 
 ## 9. Open assumptions to validate during implementation
 
-1. PostgreSQL 18 and Go are available in the normal local development environment.
+1. PostgreSQL 18.4 is available for local testing in the dedicated
+   `readiness-postgres` Docker container at `127.0.0.1:55432`; connection details
+   and lifecycle commands are defined in the formal specification.
 2. The supplied CSV values conform to the documented columns; strict inspection
    will determine maximum field sizes and exact malformed-data fixtures.
-3. The local IRS stub's permanent idempotency rows model the receiver guarantee
-   required by the assignment. A production adapter must verify equivalent IRS
-   semantics before reuse.
+3. The local IRS stub's in-memory UTID and original-record uniqueness model the
+   receiver guarantee only while one stub process remains alive. A production
+   adapter must verify equivalent durable IRS semantics before reuse.
 4. Performance budgets must be recorded with CPU, memory, storage, Go,
    PostgreSQL, and configuration details; no research result substitutes for the
    required benchmark on the supplied files.
