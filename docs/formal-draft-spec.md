@@ -85,37 +85,48 @@ duplication.
 
 ## 5. Architecture
 
-Use one small Go application codebase and one PostgreSQL application database.
-The prebuilt `irs/` service runs as a separately addressed Go process at
-`http://127.0.0.1:8081` and owns in-memory state. The application MUST interact
-with it only over HTTP and MUST NOT import stub packages or share memory or a
-transaction with it.
+Use three small sibling Go modules and one PostgreSQL application database:
+
+- `service/` is the executable application and orchestration layer;
+- `postgres/` is the PostgreSQL adapter and versioned schema; and
+- `irs/` is the separately addressed IRS stub.
+
+The prebuilt `irs/` process runs at `http://127.0.0.1:8081` and owns in-memory
+state. The service MUST interact with it only over HTTP and MUST NOT import stub
+packages or share memory or a transaction with it.
 
 ```text
-CSV.GZ -> importer -> PostgreSQL application database
-                         |             |
-                         |             +-> server-rendered status UI
-                         v
-                    filing worker -> HTTP/XML -> live IRS stub (in memory)
+CSV.GZ -> service importer -> postgres lifecycle API -> PostgreSQL
+        |                    ^
+        v                    |
+      filing orchestrator ------+
+        |
+        +-> HTTP/XML -> live IRS stub (in memory)
+        |
+        +-> server-rendered status UI
 ```
 
 PostgreSQL is also the work queue. `submission_batches` is the transactional
 outbox and state machine; no Redis, Kafka, generic job framework, or workflow
 engine is required.
 
-### 5.1 Go package boundaries
+### 5.1 Module boundaries
 
 ```text
-cmd/readiness       CLI: serve, worker, import, determine
-internal/domain     money, ruleset, filing identity, state transitions
-internal/app        orchestration, data lifecycle interfaces, API DTOs
-internal/importer   gzip/CSV streaming
-internal/store      data lifecycle implementation, PostgreSQL queries and transactions
-internal/filing     batch planner, submit/reconcile worker, rate gate
-internal/irsclient  typed HTTP adapter
-internal/status     truthful status projection
-internal/web        net/http handlers and html/template views
-db/migrations       forward-only numbered SQL applied separately by psql
+service/
+  cmd/readiness       process entry point and commands
+  internal/config     environment and flag validation
+  internal/importer   file discovery, gzip/CSV streaming, source DTO adaptation
+  internal/filing     worker orchestration, retry policy, graceful shutdown
+  internal/irsclient  typed HTTP/XML adapter
+  internal/web        handlers and server-rendered views
+
+postgres/
+  lifecycle           exported persistence-neutral API and DTOs
+  store               exported constructor backed by an internal pgx implementation
+  db/migrations       forward-only numbered SQL applied separately by psql
+
+irs/                  standalone local IRS HTTP stub
 ```
 
 The standalone stub is already implemented under `irs/`; it is a test
@@ -123,23 +134,97 @@ dependency rather than an application package. Its
 [`README.md`](../irs/README.md) and [`openapi.yaml`](../irs/openapi.yaml) are the
 authoritative remote contract.
 
-The domain package MUST NOT import HTTP or PostgreSQL packages. Interfaces MUST
-be introduced only where a use case needs to replace an adapter in a test. A
-generic repository layer is forbidden.
+The `service` module MAY import only the exported PostgreSQL lifecycle API and
+constructor. It MUST NOT import `pgx`, issue SQL, name tables, manage database
+transactions, set RLS context, acquire PostgreSQL locks, or interpret PostgreSQL
+error codes. It treats the database as a typed lifecycle port.
 
-Only `internal/store` may import `pgx` or contain application SQL. It implements
-the data lifecycle interfaces owned by `internal/app`; domain and orchestration
-code do not import the concrete store. Core packages must not receive
-transactions, rows, SQL strings, or database error codes.
+Only the `postgres` module may import `pgx` or contain application SQL. It owns
+schema version checks, RLS context, constraints, queries, serialization of
+durable database values, transactions, claims, and rate-gate persistence. It
+MUST NOT discover files, parse gzip/CSV, call the IRS, implement retry policy,
+run HTTP servers, or decide which lifecycle call follows an IRS response.
+
+The current lifecycle types and store implementation MUST be promoted from
+`postgres/internal/app` and `postgres/internal/store` to importable public
+packages before `service/` can consume them. Go sibling modules cannot import
+another module's `internal` packages. The exported surface MUST remain the
+minimal API specified by [`postgres/README.md`](../postgres/README.md); no
+generic repository layer is allowed.
+
 Schema migrations are an operator action and MUST NOT run automatically during
-application startup.
+service startup.
+
+### 5.2 Remaining `service/` implementation
+
+The `service/` module is the remaining application layer. It MUST implement:
+
+1. **Startup and composition**
+   - parse and validate command flags and environment variables;
+   - configure structured logging without secrets or source data;
+   - open the PostgreSQL lifecycle adapter and fail fast on connectivity or
+     schema-version mismatch;
+   - create the IRS HTTP client with finite connect, response-header, and total
+     timeouts; and
+   - start only the requested `import`, `determine`, `worker`, or `serve` mode.
+
+2. **File discovery and import adaptation**
+   - accept explicit firm ID, tax year, and file or directory path;
+   - discover only `.csv.gz` inputs in deterministic lexical order;
+   - require an unambiguous firm mapping rather than infer firm identity from
+     source rows;
+   - open and decompress one file at a time, validate the exact UTF-8 header,
+     parse CSV incrementally, and assign one-based source record numbers;
+   - compute SHA-256 over the decompressed CSV byte stream; and
+   - expose a bounded pull source that reshapes the eight CSV strings into the
+     PostgreSQL lifecycle `PaymentRow` DTO without retaining the full file.
+
+   The service validates transport-level file concerns: path, gzip, UTF-8,
+   header, CSV quoting, and row width. PostgreSQL lifecycle import validates
+   field values and atomically persists or rejects the dataset.
+
+3. **Determination and batch planning orchestration**
+   - call `ImportDataset`, `DetermineDataset`, and `PlanBatches` in that order;
+   - treat matching replay results as success and immutable-input conflicts as
+     operator-visible failures; and
+   - report durable IDs and counts returned by the lifecycle API.
+
+4. **Filing worker**
+   - enumerate configured firm IDs and call `ClaimNextBatch` per firm;
+   - select submit, UTID lookup, or ReceiptId polling strictly from
+     `BatchWork.NextAction`;
+   - acquire exactly one `CallPermit` around each IRS HTTP request and always
+     finish or close it;
+   - map HTTP, XML, and IRS error outcomes to the matching lifecycle event call;
+   - apply bounded exponential backoff with injected deterministic jitter in
+     tests; and
+   - never construct a replacement UTID, mutate payload bytes, or resubmit an
+     ambiguous batch before authoritative UTID lookup.
+
+5. **Status and web delivery**
+   - query `FirmStatus`, `ClientStatus`, `Exceptions`, and
+     `PaymentExplanation` for every page request;
+   - render committed facts directly without a process-memory status cache; and
+   - expose light actions to start import, determination, planning, and workers
+     without embedding workflow truth in HTTP handler state.
+
+6. **Process lifecycle**
+   - stop accepting new work on shutdown;
+   - cancel idle waits and HTTP requests;
+   - allow bounded in-flight lifecycle persistence; and
+   - remain correct when graceful shutdown is bypassed by `SIGKILL`.
+
+The service MUST be testable with fake PostgreSQL lifecycle and IRS interfaces.
+Its unit tests MUST NOT require PostgreSQL. Cross-module E2E tests use the real
+`postgres` adapter and live IRS stub.
 
 ## 6. Technology decision
 
-The runtime stack MUST be:
+The repository runtime stack MUST be:
 
 - Go standard library for HTTP, templates, CSV, gzip, hashing, logging, and tests.
-- `github.com/jackc/pgx/v5` as the only required application library.
+- `github.com/jackc/pgx/v5` as the only required third-party library, confined
+  to the `postgres` module.
 - PostgreSQL 18, pinned to a stable minor release in the local environment.
 - Plain numbered SQL migrations applied by `psql`.
 - Server-rendered HTML with small project-owned CSS; no JavaScript framework.
@@ -284,9 +369,9 @@ aggregate determination and payment explanation query MUST use that view.
 
 ## 8. Logical database schema
 
-The [PostgreSQL data model and storage boundary specification](postgres-data-model-spec.md)
+The [PostgreSQL data model and storage boundary specification](../postgres/README.md)
 defines the authoritative physical model, migration protocol, role grants,
-transaction boundaries, and `internal/store` API. Numbered implementation
+transaction boundaries, and exported lifecycle API. Numbered implementation
 migrations remain authoritative for exact SQL. This table is the cross-system
 summary of minimum shape and load-bearing constraints.
 
@@ -701,21 +786,27 @@ permission to generate a new identity for an in-progress batch.
 
 Additional mandatory tests:
 
-| Test                       | Proof                                                                                                                                           |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TEST-IMP-IDEMP-01`        | Import same file twice; compare complete table checksums/counts before and after.                                                               |
-| `TEST-IMP-KILL-01`         | Kill importer during COPY and during merge; retry produces exact source row count once.                                                         |
-| `TEST-IMP-MEM-01`          | 1x and 4x streaming fixtures meet flat-memory criterion.                                                                                        |
-| `TEST-TENANT-01`           | Cross-firm read/write/link attempts fail or return no rows.                                                                                     |
-| `TEST-DET-RULES-01`        | All six supplied situations produce exact expected totals, inclusion reasons, and obligations.                                                  |
-| `TEST-DET-BOUNDARY-01`     | 599.99, 600.00, 600.01; positive withholding below threshold; net zero/negative.                                                                |
-| `TEST-TX-MATRIX-01`        | Deterministic failure injection at every transition in Section 15 converges after restart.                                                      |
-| `TEST-TX-CONCURRENCY-01`   | Multiple workers converge to one UTID/ReceiptId result set; duplicate intake attempts create no second visible transmission.                    |
-| `TEST-TX-PAYLOAD-01`       | A changed canonical XML hash for a stored UTID fails locally before HTTP; stable XML is used for every retry.                                   |
-| `TEST-LIVE-E2E-01`         | Health check, multipart XML intake, UTID/ReceiptId lookup, delayed acknowledgment, and local result persistence work against `IRS_BASE_URL`.    |
-| `TEST-RATE-01`             | Two firms, many clients, submit/status mix, retries, and restarts never exceed either firm budget in durable logs and a recording transport.    |
-| `TEST-STATUS-01`           | Each status and precedence combination matches committed facts before and after restart.                                                        |
-| Existing `irs/` race suite | `go test -race ./...` in `irs/` proves wire validation, fault thresholds, duplicate handling, delayed acknowledgment, and rejection precedence. |
+| Test                       | Proof                                                                                                                                              |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TEST-IMP-IDEMP-01`        | Import same file twice; compare complete table checksums/counts before and after.                                                                  |
+| `TEST-IMP-KILL-01`         | Kill importer during COPY and during merge; retry produces exact source row count once.                                                            |
+| `TEST-IMP-MEM-01`          | 1x and 4x streaming fixtures meet flat-memory criterion.                                                                                           |
+| `TEST-TENANT-01`           | Cross-firm read/write/link attempts fail or return no rows.                                                                                        |
+| `TEST-DET-RULES-01`        | All six supplied situations produce exact expected totals, inclusion reasons, and obligations.                                                     |
+| `TEST-DET-BOUNDARY-01`     | 599.99, 600.00, 600.01; positive withholding below threshold; net zero/negative.                                                                   |
+| `TEST-TX-MATRIX-01`        | Deterministic failure injection at every transition in Section 15 converges after restart.                                                         |
+| `TEST-TX-CONCURRENCY-01`   | Multiple workers converge to one UTID/ReceiptId result set; duplicate intake attempts create no second visible transmission.                       |
+| `TEST-TX-PAYLOAD-01`       | A changed canonical XML hash for a stored UTID fails locally before HTTP; stable XML is used for every retry.                                      |
+| `TEST-LIVE-E2E-01`         | Health check, multipart XML intake, UTID/ReceiptId lookup, delayed acknowledgment, and local result persistence work against `IRS_BASE_URL`.       |
+| `TEST-RATE-01`             | Two firms, many clients, submit/status mix, retries, and restarts never exceed either firm budget in durable logs and a recording transport.       |
+| `TEST-STATUS-01`           | Each status and precedence combination matches committed facts before and after restart.                                                           |
+| `TEST-SVC-STARTUP-01`      | Each command validates only its required configuration, composes adapters, and fails fast on lifecycle schema mismatch.                            |
+| `TEST-SVC-IMPORT-01`       | File and directory discovery, gzip errors, exact header, UTF-8, CSV quoting/newlines, row numbering, and decompressed-stream hash are exact.       |
+| `TEST-SVC-ORCHESTRATE-01`  | Fake lifecycle tests prove import, determination, and planning call order, idempotent replay handling, and operator-visible conflicts.             |
+| `TEST-SVC-WORKER-01`       | A fake lifecycle and recording HTTP transport exhaustively map every `NextAction`, HTTP result, XML result, and retry class to one lifecycle call. |
+| `TEST-SVC-SHUTDOWN-01`     | Shutdown stops new claims, cancels waits and HTTP, and gives in-flight persistence a bounded completion period.                                    |
+| `TEST-WEB-01`              | HTTP integration tests prove actions invoke orchestration and every rendered status comes from lifecycle queries.                                  |
+| Existing `irs/` race suite | `go test -race ./...` in `irs/` proves wire validation, fault thresholds, duplicate handling, delayed acknowledgment, and rejection precedence.    |
 
 Property/fuzz tests MUST cover money parsing, canonicalization, deterministic
 filing/batch keys, CSV quoting/newlines, and state-transition rejection.

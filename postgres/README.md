@@ -3,9 +3,9 @@
 Status: Draft for implementation review
 Date: 2026-08-30
 Target: PostgreSQL 18.4 and `github.com/jackc/pgx/v5`
-Companions: [Project requirements](README.md),
-[system specification](formal-draft-spec.md), and
-[research decisions](research-and-decisions.md)
+Companions: [Project requirements](../docs/README.md),
+[system specification](../docs/formal-draft-spec.md), and
+[research decisions](../docs/research-and-decisions.md)
 
 ## 1. Scope
 
@@ -67,7 +67,25 @@ DSN. The application role receives `SELECT` only on `schema_migrations`.
 matches the version required by the binary.
 
 The local migration and application DSNs, container commands, and credentials
-are documented in the [system specification](formal-draft-spec.md#61-local-postgresql-test-instance).
+are documented in the
+[system specification](../docs/formal-draft-spec.md#61-local-postgresql-test-instance).
+
+### 3.1 Local commands
+
+From `postgres/`, with `readiness-postgres` running:
+
+```sh
+make migrate
+make test
+make test-race
+make test-e2e
+make test-live
+```
+
+`make test-e2e` uses the dedicated PostgreSQL instance and disposable databases
+for migration tests. `make test-live` also requires the IRS stub at
+`http://127.0.0.1:8081`. Both targets accept the DSN and IRS environment
+overrides defined in the Makefile and lifecycle specification.
 
 ## 4. Database rules
 
@@ -395,14 +413,14 @@ does not expose database rows.
 
 The API returns errors compatible with `errors.Is`:
 
-| Error | Meaning |
-| --- | --- |
-| `ErrSchemaVersion` | Binary and schema versions do not match |
-| `ErrConflict` | An idempotency identity exists with different immutable input |
-| `ErrNotFound` | A requested durable identity does not exist for the firm |
-| `ErrInvalidTransition` | The event is not legal from the current durable state |
-| `ErrStaleClaim` | The opaque claim no longer owns the work |
-| `ErrInvariant` | Stored identity, payload, or result facts disagree |
+| Error                  | Meaning                                                       |
+| ---------------------- | ------------------------------------------------------------- |
+| `ErrSchemaVersion`     | Binary and schema versions do not match                       |
+| `ErrConflict`          | An idempotency identity exists with different immutable input |
+| `ErrNotFound`          | A requested durable identity does not exist for the firm      |
+| `ErrInvalidTransition` | The event is not legal from the current durable state         |
+| `ErrStaleClaim`        | The opaque claim no longer owns the work                      |
+| `ErrInvariant`         | Stored identity, payload, or result facts disagree            |
 
 Errors MUST NOT include SQL, PostgreSQL codes, DSNs, TINs, memos, or canonical
 XML. Cancellation and deadlines use standard context errors.
@@ -415,20 +433,20 @@ changes no rows and returns a typed error.
 
 ## 9. Acceptance evidence
 
-| Requirement                         | Database or store proof                                                        |
-| ----------------------------------- | ------------------------------------------------------------------------------ |
-| Versioned schema                    | Fresh migration, one-version upgrade, and failed-migration rollback tests      |
-| Import idempotency and interruption | Same-file replay, concurrent import, and forced rollback tests                 |
-| Flat import memory                  | Streaming source and 1x/4x RSS test                                            |
-| Firm isolation                      | RLS read/write/link tests using the non-owner role and pooled connections      |
-| Correct determination               | Six required situations, boundary amounts, and explanation query tests         |
-| Zero duplicate filing intent        | Filing identity, filing key, UTID, and one-batch-per-filing unique constraints |
-| Crash recovery                      | Batch transition and process-restart E2E tests against the live stub           |
-| At most 100 filings per client      | Slot checks, composite keys, and batch planner test                            |
-| Immutable acknowledgment            | Malformed result-set rollback and terminal-result update rejection tests       |
-| Shared 20/60 firm budget            | Concurrent rate-permit test and rolling `api_call_log` query                   |
-| Truthful status                     | Projection precedence tests before and after worker restart                    |
-| Performance                         | Import, determination, and status budgets from the project requirements        |
+| Requirement                         | Database or store proof                                                                                  |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Versioned schema                    | Fresh migration, one-version upgrade, and failed-migration rollback tests                                |
+| Import idempotency and interruption | Same-file replay, concurrent import, and forced rollback tests                                           |
+| Flat import memory                  | Streaming source and 1x/4x RSS test                                                                      |
+| Firm isolation                      | RLS read/write/link tests using the non-owner role and pooled connections                                |
+| Correct determination               | Six required situations, boundary amounts, and explanation query tests                                   |
+| Zero duplicate filing intent        | Filing identity, filing key, UTID, and one-batch-per-filing unique constraints                           |
+| Crash recovery                      | Batch transition and process-restart E2E tests against the live stub                                     |
+| At most 100 filings per client      | Slot checks, composite keys, and batch planner test                                                      |
+| Immutable acknowledgment            | Malformed result-set rollback and terminal-result update rejection tests                                 |
+| Shared 20/60 firm budget            | Concurrent rate-permit test and rolling `api_call_log` query                                             |
+| Truthful status                     | Projection precedence tests before and after worker restart                                              |
+| Performance                         | Import, determination, and status budgets from the project requirements                                  |
 | Clean storage boundary              | Core packages compile without SQL, pgx, or store imports; orchestration tests use a fake `DataLifecycle` |
 
 ## 10. Definition of done
@@ -437,3 +455,45 @@ The database boundary is complete when migrations create this model on a fresh
 PostgreSQL 18.4 database, all acceptance evidence above passes using the
 non-owner runtime role, and core packages access PostgreSQL only through their
 small store interfaces.
+
+## 11. Filing lifecycle architecture
+
+```mermaid
+flowchart TB
+  CSV[CSV.GZ stream] --> Import[ImportDataset]
+  Import --> SourceFacts[(Dataset and immutable payments)]
+  SourceFacts --> Determine[DetermineDataset]
+  Determine --> Preflight{Preflight result}
+  Preflight -->|Needs correction| Blocked[blocked_preflight]
+  Preflight -->|Ready| Plan[PlanBatches]
+  Plan --> Planned[(planned batch with stable UTID and XML)]
+
+  Planned --> Claim[ClaimNextBatch]
+  Claim --> Action{NextAction}
+
+  Action -->|submit| SubmitPermit[Acquire firm call permit]
+  SubmitPermit --> IRSSubmit[IRS submit]
+  IRSSubmit -->|ReceiptId| Submitted[RecordSubmitAccepted]
+  IRSSubmit -->|Ambiguous error| Unknown[RecordSubmitUnknown]
+
+  Unknown --> Claim
+  Action -->|lookup_by_utid| LookupPermit[Acquire firm call permit]
+  LookupPermit --> IRSLookup[IRS status by UTID]
+  IRSLookup -->|Not found| NotFound[RecordReferenceNotFound]
+  NotFound --> Claim
+  IRSLookup -->|Found ReceiptId| Found[RecordReferenceFound]
+
+  Submitted --> Claim
+  Found --> Claim
+  Action -->|poll_status| PollPermit[Acquire firm call permit]
+  PollPermit --> IRSPoll[IRS status by ReceiptId]
+  IRSPoll -->|Processing| Pending[RecordAcknowledgmentPending]
+  Pending --> Claim
+  IRSPoll -->|Per-filing results| Complete[CompleteAcknowledgment]
+
+  Complete --> Accepted[(accepted filings)]
+  Complete --> Rejected[(rejected filings)]
+  Blocked --> Status[Truthful status and exceptions]
+  Accepted --> Status
+  Rejected --> Status
+```
