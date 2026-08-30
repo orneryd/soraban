@@ -1,0 +1,366 @@
+openapi: 3.1.0
+info:
+  title: Local IRIS A2A Stub
+  version: 0.1.0
+  description: |
+    In-memory exercise profile of the IRS IRIS A2A intake and status APIs.
+    This is not an official IRS schema. See README.md for normative behavior,
+    XML examples, fault injection, and idempotency semantics.
+  license:
+    name: MIT
+    identifier: MIT
+externalDocs:
+  description: IRS Publication 5718, IRIS A2A Specifications
+  url: https://www.irs.gov/pub/irs-pdf/p5718.pdf
+servers:
+  - url: http://127.0.0.1:8081
+    description: Local stub
+tags:
+  - name: IRIS A2A
+  - name: Operations
+paths:
+  /IRIntakeAcceptanceA2A/1.0/irisa2a/v1/intake-acceptance:
+    post:
+      operationId: submitTransmission
+      summary: Submit one 1099-NEC transmission
+      description: |
+        Accepts exactly one XML file part containing one firm, one client, and
+        1-100 records. A successful response contains only an opaque ReceiptId.
+        A 503 can occur before recording or after the complete transmission has
+        been recorded; callers must reconcile by UTID.
+      tags:
+        - IRIS A2A
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/AcceptXML'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: XML document conforming to the README exercise profile.
+            encoding:
+              file:
+                contentType: text/xml, application/xml
+      responses:
+        '200':
+          description: Transmission recorded; ReceiptId generated.
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/ReceiptId'
+              examples:
+                success:
+                  value: '<ReceiptId>rcpt_01JABCDEFGHJKMNPQRSTVWXYZ</ReceiptId>'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /IRIntakeAcceptanceA2A/1.0/iris/transstatusorack:
+    post:
+      operationId: getTransmissionStatusOrAcknowledgment
+      summary: Retrieve status or acknowledgment by ReceiptId or UTID
+      tags:
+        - IRIS A2A
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/AcceptXML'
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              $ref: '#/components/schemas/TransStatusOrAckRequest'
+            examples:
+              byReceiptId:
+                value: |-
+                  <TransStatusOrAckRequest>
+                    <TransmitterControlCd>F001</TransmitterControlCd>
+                    <SearchParameterTypeCd>RECEIPTID</SearchParameterTypeCd>
+                    <SearchParameterTxt>rcpt_01JABCDEFGHJKMNPQRSTVWXYZ</SearchParameterTxt>
+                  </TransStatusOrAckRequest>
+              byUTID:
+                value: |-
+                  <TransStatusOrAckRequest>
+                    <TransmitterControlCd>F001</TransmitterControlCd>
+                    <SearchParameterTypeCd>UTID</SearchParameterTypeCd>
+                    <SearchParameterTxt>550e8400-e29b-41d4-a716-446655440000:IRIS:F001::A</SearchParameterTxt>
+                  </TransStatusOrAckRequest>
+      responses:
+        '200':
+          description: Processing status or completed per-record acknowledgment.
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/TransStatusOrAckResponse'
+              examples:
+                processing:
+                  value: |-
+                    <TransStatusOrAckResponse>
+                      <ReceiptId>rcpt_01JABCDEFGHJKMNPQRSTVWXYZ</ReceiptId>
+                      <UniqueTransmissionId>550e8400-e29b-41d4-a716-446655440000:IRIS:F001::A</UniqueTransmissionId>
+                      <TransmissionStatusCd>Processing</TransmissionStatusCd>
+                    </TransStatusOrAckResponse>
+                acknowledged:
+                  value: |-
+                    <TransStatusOrAckResponse>
+                      <ReceiptId>rcpt_01JABCDEFGHJKMNPQRSTVWXYZ</ReceiptId>
+                      <UniqueTransmissionId>550e8400-e29b-41d4-a716-446655440000:IRIS:F001::A</UniqueTransmissionId>
+                      <TransmissionStatusCd>PartiallyAccepted</TransmissionStatusCd>
+                      <RecordResultGrp>
+                        <RecordId>filing-key-001</RecordId>
+                        <RecordStatusCd>Accepted</RecordStatusCd>
+                        <IRSRecordId>irsrec_01JABCDEFGHJKMNPQRSTVWXYZ</IRSRecordId>
+                      </RecordResultGrp>
+                      <RecordResultGrp>
+                        <RecordId>filing-key-002</RecordId>
+                        <RecordStatusCd>Rejected</RecordStatusCd>
+                        <ErrorReasonCd>TIN_MISSING</ErrorReasonCd>
+                      </RecordResultGrp>
+                    </TransStatusOrAckResponse>
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+  /healthz:
+    get:
+      operationId: health
+      summary: Process liveness probe
+      tags:
+        - Operations
+      security: []
+      responses:
+        '200':
+          description: Process is running.
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: "ok\n"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque local token
+
+  parameters:
+    AcceptXML:
+      name: Accept
+      in: header
+      required: true
+      schema:
+        type: string
+        const: application/xml
+
+  schemas:
+    ReceiptId:
+      type: string
+      minLength: 1
+      description: Opaque server-generated submission identifier.
+      xml:
+        name: ReceiptId
+
+    TransStatusOrAckRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - transmitterControlCd
+        - searchParameterTypeCd
+        - searchParameterTxt
+      xml:
+        name: TransStatusOrAckRequest
+      properties:
+        transmitterControlCd:
+          type: string
+          minLength: 1
+          xml:
+            name: TransmitterControlCd
+        searchParameterTypeCd:
+          type: string
+          enum:
+            - RECEIPTID
+            - UTID
+          xml:
+            name: SearchParameterTypeCd
+        searchParameterTxt:
+          type: string
+          minLength: 1
+          xml:
+            name: SearchParameterTxt
+
+    TransStatusOrAckResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - receiptId
+        - uniqueTransmissionId
+        - transmissionStatusCd
+      xml:
+        name: TransStatusOrAckResponse
+      properties:
+        receiptId:
+          type: string
+          minLength: 1
+          xml:
+            name: ReceiptId
+        uniqueTransmissionId:
+          type: string
+          minLength: 1
+          xml:
+            name: UniqueTransmissionId
+        transmissionStatusCd:
+          $ref: '#/components/schemas/TransmissionStatusCd'
+        recordResults:
+          type: array
+          description: Absent while Processing; one item per submitted record afterward.
+          items:
+            $ref: '#/components/schemas/RecordResultGrp'
+
+    TransmissionStatusCd:
+      type: string
+      enum:
+        - Processing
+        - Accepted
+        - PartiallyAccepted
+        - Rejected
+      xml:
+        name: TransmissionStatusCd
+
+    RecordResultGrp:
+      type: object
+      additionalProperties: false
+      required:
+        - recordId
+        - recordStatusCd
+      oneOf:
+        - required:
+            - irsRecordId
+          properties:
+            recordStatusCd:
+              const: Accepted
+        - required:
+            - errorReasonCd
+          properties:
+            recordStatusCd:
+              const: Rejected
+      xml:
+        name: RecordResultGrp
+      properties:
+        recordId:
+          type: string
+          minLength: 1
+          xml:
+            name: RecordId
+        recordStatusCd:
+          type: string
+          enum:
+            - Accepted
+            - Rejected
+          xml:
+            name: RecordStatusCd
+        irsRecordId:
+          type: string
+          minLength: 1
+          xml:
+            name: IRSRecordId
+        errorReasonCd:
+          $ref: '#/components/schemas/ErrorReasonCd'
+
+    ErrorReasonCd:
+      type: string
+      enum:
+        - TIN_MISSING
+        - TIN_MALFORMED
+        - TIN_INVALID
+        - AMOUNT_INVALID
+      xml:
+        name: ErrorReasonCd
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - errorCd
+        - errorMessageTxt
+      xml:
+        name: ErrorResponse
+      properties:
+        errorCd:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - UNAUTHORIZED
+            - NOT_FOUND
+            - DUPLICATE_UTID
+            - DUPLICATE_RECORD
+            - UNSUPPORTED_MEDIA_TYPE
+            - SERVICE_UNAVAILABLE
+          xml:
+            name: ErrorCd
+        errorMessageTxt:
+          type: string
+          minLength: 1
+          xml:
+            name: ErrorMessageTxt
+
+  responses:
+    InvalidRequest:
+      description: The request is malformed or violates the exercise XML profile.
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Bearer token is absent or invalid.
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: The ReceiptId or UTID is not recorded for this firm.
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: The UTID or an original record identity already exists.
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnsupportedMediaType:
+      description: Request or file part has an unsupported media type.
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: Injected failure before recording or after a complete atomic record.
+      content:
+        application/xml:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
