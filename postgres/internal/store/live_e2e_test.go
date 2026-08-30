@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"readiness/postgres/internal/app"
+	"readiness.local/postgres/internal/app"
 )
 
 const (

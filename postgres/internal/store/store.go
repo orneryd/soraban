@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"readiness/postgres/internal/app"
+	"readiness.local/postgres/internal/app"
 )
 
 type Store struct {
@@ -24,7 +24,7 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, errors.New("invalid database configuration")
 	}
-	config.ConnConfig.RuntimeParams["statement_timeout"] = "30s"
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "120s"
 	config.ConnConfig.RuntimeParams["lock_timeout"] = "10s"
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {

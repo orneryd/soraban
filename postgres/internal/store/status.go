@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"readiness/postgres/internal/app"
+	"readiness.local/postgres/internal/app"
 )
 
 type clientStatusFacts struct {
@@ -88,32 +88,50 @@ func (store *Store) FirmStatus(ctx context.Context, query app.FirmStatusQuery) (
 		return app.FirmStatus{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	rows, err := tx.Query(ctx, `SELECT id FROM clients WHERE firm_id=$1 ORDER BY id`, query.FirmID)
+	rows, err := tx.Query(ctx, `
+		WITH filing_counts AS (
+			SELECT client_id,
+			       count(*) AS required,
+			       count(*) FILTER (WHERE state='blocked_preflight') AS blocked,
+			       count(*) FILTER (WHERE state='ready') AS ready,
+			       count(*) FILTER (WHERE state='batched') AS pending,
+			       count(*) FILTER (WHERE state='accepted') AS accepted,
+			       count(*) FILTER (WHERE state='rejected') AS rejected,
+			       bool_or(state IN ('blocked_preflight','rejected')) AS filing_attention
+			FROM filings WHERE firm_id=$1 GROUP BY client_id
+		), batch_flags AS (
+			SELECT client_id,
+			       bool_or(state='invariant_failed'
+			          OR (state IN ('submitted','awaiting_ack')
+			              AND COALESCE(submitted_at,next_action_at) < clock_timestamp()-interval '30 minutes')) AS batch_attention,
+			       bool_or(state IN ('submitting','submit_unknown','submitted','awaiting_ack')) AS awaiting
+			FROM submission_batches WHERE firm_id=$1 GROUP BY client_id
+		)
+		SELECT c.id,
+		       COALESCE(f.required,0), COALESCE(f.blocked,0), COALESCE(f.ready,0),
+		       COALESCE(f.pending,0), COALESCE(f.accepted,0), COALESCE(f.rejected,0),
+		       COALESCE(f.filing_attention,false) OR COALESCE(b.batch_attention,false),
+		       COALESCE(b.awaiting,false)
+		FROM clients c
+		LEFT JOIN filing_counts f ON f.client_id=c.id
+		LEFT JOIN batch_flags b ON b.client_id=c.id
+		WHERE c.firm_id=$1 ORDER BY c.id`, query.FirmID)
 	if err != nil {
 		return app.FirmStatus{}, mapError(err)
 	}
-	var clientIDs []string
+	result := app.FirmStatus{FirmID: query.FirmID, Headline: app.HeadlineFullyFiled}
 	for rows.Next() {
-		var clientID string
-		if err := rows.Scan(&clientID); err != nil {
+		var facts clientStatusFacts
+		facts.status.FirmID = query.FirmID
+		if err := rows.Scan(
+			&facts.status.ClientID, &facts.status.Counts.Required, &facts.status.Counts.Blocked,
+			&facts.status.Counts.Ready, &facts.status.Counts.Pending, &facts.status.Counts.Accepted,
+			&facts.status.Counts.Rejected, &facts.attention, &facts.awaiting,
+		); err != nil {
 			rows.Close()
 			return app.FirmStatus{}, mapError(err)
 		}
-		clientIDs = append(clientIDs, clientID)
-	}
-	if err := rows.Err(); err != nil {
-		return app.FirmStatus{}, mapError(err)
-	}
-	rows.Close()
-	if len(clientIDs) == 0 {
-		return app.FirmStatus{}, app.ErrNotFound
-	}
-	result := app.FirmStatus{FirmID: query.FirmID, Headline: app.HeadlineFullyFiled}
-	for _, clientID := range clientIDs {
-		facts, err := readClientStatus(ctx, tx, query.FirmID, clientID)
-		if err != nil {
-			return app.FirmStatus{}, err
-		}
+		facts.status.Headline = headline(facts)
 		result.Clients = append(result.Clients, facts.status)
 		result.Counts.Required += facts.status.Counts.Required
 		result.Counts.Blocked += facts.status.Counts.Blocked
@@ -128,6 +146,13 @@ func (store *Store) FirmStatus(ctx context.Context, query app.FirmStatusQuery) (
 		} else if result.Headline == app.HeadlineFullyFiled && facts.status.Headline == app.HeadlinePartiallyFiled {
 			result.Headline = app.HeadlinePartiallyFiled
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return app.FirmStatus{}, mapError(err)
+	}
+	rows.Close()
+	if len(result.Clients) == 0 {
+		return app.FirmStatus{}, app.ErrNotFound
 	}
 	if err := commit(ctx, tx); err != nil {
 		return app.FirmStatus{}, err

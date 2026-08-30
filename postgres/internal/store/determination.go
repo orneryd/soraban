@@ -4,21 +4,12 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"strings"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
-	"readiness/postgres/internal/app"
+	"readiness.local/postgres/internal/app"
 )
-
-type filingCandidate struct {
-	clientID          string
-	vendorIdentity    string
-	vendorDisplayName string
-	recipientTIN      string
-	reportableCents   int64
-	withholdingCents  int64
-}
 
 func (store *Store) DetermineDataset(ctx context.Context, command app.DetermineDatasetCommand) (app.DeterminationResult, error) {
 	if command.DatasetID <= 0 || command.RulesetVersion != app.RulesetNEC2025V1 {
@@ -66,7 +57,7 @@ func (store *Store) DetermineDataset(ctx context.Context, command app.DetermineD
 		return app.DeterminationResult{}, mapError(err)
 	}
 
-	rows, err := tx.Query(ctx, `
+	err = tx.QueryRow(ctx, `
 		WITH classified AS (
 			SELECT * FROM payment_classification_nec_2025_v1 WHERE dataset_id = $1 AND firm_id = $2
 		), aggregates AS (
@@ -80,59 +71,55 @@ func (store *Store) DetermineDataset(ctx context.Context, command app.DetermineD
 			SELECT client_id, vendor_identity, vendor_name,
 			       row_number() OVER (PARTITION BY client_id, vendor_identity ORDER BY count(*) DESC, vendor_name) AS rank
 			FROM classified GROUP BY client_id, vendor_identity, vendor_name
-		)
-		SELECT a.client_id, a.vendor_identity, n.vendor_name,
-		       CASE WHEN a.vendor_identity LIKE 'tin:%' THEN substring(a.vendor_identity FROM 5) ELSE '' END,
-		       a.reportable_cents, a.withholding_cents
-		FROM aggregates a JOIN names n USING (client_id, vendor_identity)
-		WHERE n.rank = 1 ORDER BY a.client_id, a.vendor_identity`, command.DatasetID, command.FirmID)
-	if err != nil {
-		return app.DeterminationResult{}, mapError(err)
-	}
-	var candidates []filingCandidate
-	for rows.Next() {
-		var candidate filingCandidate
-		if err := rows.Scan(&candidate.clientID, &candidate.vendorIdentity, &candidate.vendorDisplayName, &candidate.recipientTIN, &candidate.reportableCents, &candidate.withholdingCents); err != nil {
-			rows.Close()
-			return app.DeterminationResult{}, mapError(err)
-		}
-		candidates = append(candidates, candidate)
-	}
-	if err := rows.Err(); err != nil {
-		return app.DeterminationResult{}, mapError(err)
-	}
-	rows.Close()
-
-	for _, candidate := range candidates {
-		key := filingKey(command.FirmID, candidate.clientID, taxYear, candidate.vendorIdentity)
-		state := "ready"
-		var reason any
-		switch {
-		case strings.HasPrefix(candidate.vendorIdentity, "missing-tin:"):
-			state, reason = "blocked_preflight", string(app.ReasonTINMissing)
-		case strings.HasPrefix(candidate.vendorIdentity, "malformed-tin:"):
-			state, reason = "blocked_preflight", string(app.ReasonTINMalformed)
-		case strings.HasPrefix(candidate.recipientTIN, "000"):
-			state, reason = "blocked_preflight", string(app.ReasonTINInvalid)
-		case candidate.reportableCents <= 0:
-			state, reason = "blocked_preflight", string(app.ReasonAmountInvalid)
-		}
-		if _, err := tx.Exec(ctx, `
+		), candidates AS (
+			SELECT a.client_id, a.vendor_identity, n.vendor_name,
+			       CASE WHEN a.vendor_identity LIKE 'tin:%' THEN substring(a.vendor_identity FROM 5) ELSE NULL END AS recipient_tin,
+			       a.reportable_cents, a.withholding_cents
+			FROM aggregates a JOIN names n USING (client_id, vendor_identity)
+			WHERE n.rank = 1
+		), prepared AS (
+			SELECT c.*,
+			       sha256(
+			           int4send(octet_length(convert_to('filing-key-v1','UTF8'))) || convert_to('filing-key-v1','UTF8') ||
+			           int4send(octet_length(convert_to($2,'UTF8'))) || convert_to($2,'UTF8') ||
+			           int4send(octet_length(convert_to(c.client_id,'UTF8'))) || convert_to(c.client_id,'UTF8') ||
+			           int4send(octet_length(convert_to($3::text,'UTF8'))) || convert_to($3::text,'UTF8') ||
+			           int4send(octet_length(convert_to('1099-NEC','UTF8'))) || convert_to('1099-NEC','UTF8') ||
+			           int4send(octet_length(convert_to(c.vendor_identity,'UTF8'))) || convert_to(c.vendor_identity,'UTF8') ||
+			           int4send(octet_length(convert_to('0','UTF8'))) || convert_to('0','UTF8')
+			       ) AS filing_key,
+			       CASE
+			           WHEN c.vendor_identity LIKE 'missing-tin:%' THEN 'blocked_preflight'
+			           WHEN c.vendor_identity LIKE 'malformed-tin:%' THEN 'blocked_preflight'
+			           WHEN c.recipient_tin LIKE '000%' THEN 'blocked_preflight'
+			           WHEN c.reportable_cents <= 0 THEN 'blocked_preflight'
+			           ELSE 'ready'
+			       END AS state,
+			       CASE
+			           WHEN c.vendor_identity LIKE 'missing-tin:%' THEN 'TIN_MISSING'
+			           WHEN c.vendor_identity LIKE 'malformed-tin:%' THEN 'TIN_MALFORMED'
+			           WHEN c.recipient_tin LIKE '000%' THEN 'TIN_INVALID'
+			           WHEN c.reportable_cents <= 0 THEN 'AMOUNT_INVALID'
+			           ELSE NULL
+			       END AS preflight_reason
+			FROM candidates c
+		), inserted AS (
 			INSERT INTO filings (
 				firm_id, client_id, determination_id, tax_year, vendor_identity,
 				vendor_display_name, recipient_tin, filing_key, reportable_cents,
 				withholding_cents, state, preflight_reason
-			) VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,$11,$12)`,
-			command.FirmID, candidate.clientID, result.DeterminationID, taxYear,
-			candidate.vendorIdentity, candidate.vendorDisplayName, candidate.recipientTIN,
-			key[:], candidate.reportableCents, candidate.withholdingCents, state, reason); err != nil {
-			return app.DeterminationResult{}, mapError(err)
-		}
-		if state == "ready" {
-			result.ReadyCount++
-		} else {
-			result.BlockedCount++
-		}
+			)
+			SELECT $2, client_id, $4, $3::integer, vendor_identity, vendor_name, recipient_tin,
+			       filing_key, reportable_cents, withholding_cents, state, preflight_reason
+			FROM prepared
+			RETURNING state
+		)
+		SELECT count(*) FILTER (WHERE state='ready'),
+		       count(*) FILTER (WHERE state='blocked_preflight')
+		FROM inserted`, command.DatasetID, command.FirmID, strconv.Itoa(taxYear), result.DeterminationID).
+		Scan(&result.ReadyCount, &result.BlockedCount)
+	if err != nil {
+		return app.DeterminationResult{}, mapError(err)
 	}
 	if err := commit(ctx, tx); err != nil {
 		return app.DeterminationResult{}, err

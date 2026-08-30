@@ -15,7 +15,7 @@ determination, transmission recovery, rate limiting, and truthful status.
 
 Numbered SQL migrations are authoritative for exact SQL. This document is
 authoritative for required tables, constraints, transaction boundaries, RLS,
-and the API exposed by `internal/store`.
+and the API exposed by `lifecycle` and implemented by `store`.
 
 The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 
@@ -23,22 +23,20 @@ The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
 
 ```text
 db/migrations/      forward-only numbered SQL, run with psql
-internal/domain/    money, identities, rules, and states
-internal/app/       orchestration, data lifecycle interfaces, and API DTOs
+lifecycle/          exported persistence-neutral aliases and sentinel errors
+store/              exported constructor and Store facade
+internal/app/       lifecycle contract implementation types
 internal/store/     all pgx usage, SQL queries, and transactions
-internal/importer/  gzip and CSV streaming
-internal/filing/    filing workflow and IRS calls
-internal/status/    status and exception use cases
 ```
 
-Only `internal/store` MAY import `pgx` or contain application SQL. Migration SQL
+Only this module's `internal/store` MAY import `pgx` or contain application SQL. Migration SQL
 MUST remain under `db/migrations` and MUST run separately from the application.
 Application startup checks the schema version but does not apply migrations.
 
-The orchestration layer owns the PostgreSQL-agnostic data lifecycle interfaces.
-`*store.Store` implements them. Domain and orchestration code MUST NOT import
-`internal/store`; only the composition root constructs the concrete store. No
-generic repository is needed.
+The exported `lifecycle` package provides the PostgreSQL-agnostic data lifecycle
+interfaces and DTOs. The exported `store` package provides the constructor and
+Store facade backed by `internal/store`. Service orchestration imports only
+these public packages. No generic repository is needed.
 
 The store API MUST NOT expose pgx types, SQL strings, table names, database error
 codes, or caller-managed transactions.
@@ -284,9 +282,9 @@ type DataLifecycle interface {
 }
 ```
 
-The concrete `internal/store.Store` is concurrency-safe and backed by a bounded
-pool. Its constructor verifies connectivity and schema version before it is
-passed to orchestration.
+The public `store.Store` facade is concurrency-safe and backed by an internal
+bounded pool. Its constructor verifies connectivity and schema version before
+it is passed to orchestration.
 
 Orchestration tests MUST run against a fake `DataLifecycle` without PostgreSQL,
 pgx, SQL fixtures, or store imports. The composition root is the only code that

@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"readiness/postgres/internal/app"
+	"readiness.local/postgres/internal/app"
 )
 
 type plannedFiling struct {
@@ -24,6 +24,22 @@ type plannedFiling struct {
 	recipientTIN      string
 	reportableCents   int64
 	withholdingCents  int64
+}
+
+type plannedBatch struct {
+	sequence     int
+	clientID     string
+	taxYear      int
+	utid         string
+	canonicalXML []byte
+	payloadHash  [32]byte
+}
+
+type plannedLink struct {
+	utid     string
+	filingID int64
+	clientID string
+	slot     int
 }
 
 func (store *Store) PlanBatches(ctx context.Context, command app.PlanBatchesCommand) (app.BatchPlanResult, error) {
@@ -74,6 +90,8 @@ func (store *Store) PlanBatches(ctx context.Context, command app.PlanBatchesComm
 	}
 	rows.Close()
 
+	batches := make([]plannedBatch, 0, (len(filings)+99)/100)
+	links := make([]plannedLink, 0, len(filings))
 	for start := 0; start < len(filings); {
 		end := start
 		for end < len(filings) && end-start < 100 && filings[end].clientID == filings[start].clientID {
@@ -96,37 +114,79 @@ func (store *Store) PlanBatches(ctx context.Context, command app.PlanBatchesComm
 			return app.BatchPlanResult{}, app.ErrInvariant
 		}
 		payloadHash := sha256.Sum256(xmlPayload)
-		var batchID int64
-		if err := tx.QueryRow(ctx, `
-			INSERT INTO submission_batches (firm_id, client_id, tax_year, utid, canonical_xml, payload_sha256, state)
-			VALUES ($1,$2,$3,$4,$5,$6,'planned') RETURNING id`, command.FirmID, group[0].clientID, group[0].taxYear, utid, xmlPayload, payloadHash[:]).Scan(&batchID); err != nil {
-			return app.BatchPlanResult{}, mapError(err)
-		}
+		batches = append(batches, plannedBatch{
+			sequence: len(batches) + 1, clientID: group[0].clientID, taxYear: group[0].taxYear,
+			utid: utid, canonicalXML: xmlPayload, payloadHash: payloadHash,
+		})
 		for index, filing := range group {
-			if _, err := tx.Exec(ctx, `INSERT INTO batch_filings (batch_id, filing_id, firm_id, client_id, slot) VALUES ($1,$2,$3,$4,$5)`, batchID, filing.id, command.FirmID, filing.clientID, index+1); err != nil {
-				return app.BatchPlanResult{}, mapError(err)
-			}
+			links = append(links, plannedLink{utid: utid, filingID: filing.id, clientID: filing.clientID, slot: index + 1})
 		}
-		if tag, err := tx.Exec(ctx, `UPDATE filings SET state = 'batched' WHERE firm_id = $1 AND id = ANY($2) AND state = 'ready'`, command.FirmID, filingIDs(group)); err != nil {
+		start = end
+	}
+	if len(batches) > 0 {
+		if _, err := tx.Exec(ctx, `
+			CREATE TEMPORARY TABLE batch_stage (
+				sequence integer, client_id text, tax_year integer, utid text,
+				canonical_xml bytea, payload_sha256 bytea
+			) ON COMMIT DROP;
+			CREATE TEMPORARY TABLE batch_link_stage (
+				utid text, filing_id bigint, client_id text, slot integer
+			) ON COMMIT DROP`); err != nil {
 			return app.BatchPlanResult{}, mapError(err)
-		} else if tag.RowsAffected() != int64(len(group)) {
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"batch_stage"},
+			[]string{"sequence", "client_id", "tax_year", "utid", "canonical_xml", "payload_sha256"},
+			pgx.CopyFromSlice(len(batches), func(index int) ([]any, error) {
+				batch := batches[index]
+				return []any{batch.sequence, batch.clientID, batch.taxYear, batch.utid, batch.canonicalXML, batch.payloadHash[:]}, nil
+			})); err != nil {
+			return app.BatchPlanResult{}, mapError(err)
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"batch_link_stage"},
+			[]string{"utid", "filing_id", "client_id", "slot"},
+			pgx.CopyFromSlice(len(links), func(index int) ([]any, error) {
+				link := links[index]
+				return []any{link.utid, link.filingID, link.clientID, link.slot}, nil
+			})); err != nil {
+			return app.BatchPlanResult{}, mapError(err)
+		}
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO submission_batches (firm_id, client_id, tax_year, utid, canonical_xml, payload_sha256, state)
+			SELECT $1, client_id, tax_year, utid, canonical_xml, payload_sha256, 'planned'
+			FROM batch_stage ORDER BY sequence`, command.FirmID)
+		if err != nil {
+			return app.BatchPlanResult{}, mapError(err)
+		}
+		result.CreatedBatchCount = tag.RowsAffected()
+		if result.CreatedBatchCount != int64(len(batches)) {
 			return app.BatchPlanResult{}, app.ErrInvariant
 		}
-		result.CreatedBatchCount++
-		start = end
+		tag, err = tx.Exec(ctx, `
+			INSERT INTO batch_filings (batch_id, filing_id, firm_id, client_id, slot)
+			SELECT b.id, l.filing_id, $1, l.client_id, l.slot
+			FROM batch_link_stage l
+			JOIN submission_batches b ON b.firm_id=$1 AND b.utid=l.utid`, command.FirmID)
+		if err != nil {
+			return app.BatchPlanResult{}, mapError(err)
+		}
+		if tag.RowsAffected() != int64(len(links)) {
+			return app.BatchPlanResult{}, app.ErrInvariant
+		}
+		tag, err = tx.Exec(ctx, `
+			UPDATE filings f SET state='batched'
+			FROM batch_link_stage l
+			WHERE f.id=l.filing_id AND f.firm_id=$1 AND f.state='ready'`, command.FirmID)
+		if err != nil {
+			return app.BatchPlanResult{}, mapError(err)
+		}
+		if tag.RowsAffected() != int64(len(links)) {
+			return app.BatchPlanResult{}, app.ErrInvariant
+		}
 	}
 	if err := commit(ctx, tx); err != nil {
 		return app.BatchPlanResult{}, err
 	}
 	return result, nil
-}
-
-func filingIDs(filings []plannedFiling) []int64 {
-	ids := make([]int64, len(filings))
-	for index := range filings {
-		ids[index] = filings[index].id
-	}
-	return ids
 }
 
 func newClaimToken() (string, error) {
@@ -172,9 +232,9 @@ func (store *Store) ClaimNextBatch(ctx context.Context, command app.ClaimBatchCo
 			claim_token = $4, attempt_count = attempt_count + 1
 		FROM candidate WHERE b.id = candidate.id
 		RETURNING b.id, b.firm_id, b.client_id, b.tax_year, b.state, b.utid,
-		          b.canonical_xml, b.payload_sha256, COALESCE(b.receipt_id, '')`,
+		          b.canonical_xml, b.payload_sha256, COALESCE(b.receipt_id, ''), b.attempt_count`,
 		command.FirmID, command.WorkerID, leaseMicros, token).
-		Scan(&work.BatchID, &work.FirmID, &work.ClientID, &work.TaxYear, &state, &work.UTID, &work.CanonicalXML, &payloadHash, &work.ReceiptID)
+		Scan(&work.BatchID, &work.FirmID, &work.ClientID, &work.TaxYear, &state, &work.UTID, &work.CanonicalXML, &payloadHash, &work.ReceiptID, &work.AttemptCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := commit(ctx, tx); err != nil {
 			return app.BatchWork{}, false, err

@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"readiness/postgres/internal/app"
+	"readiness.local/postgres/internal/app"
 )
 
 type paymentCopySource struct {

@@ -15,8 +15,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"readiness/postgres/internal/app"
-	"readiness/postgres/internal/store"
+	"readiness.local/postgres/internal/app"
+	"readiness.local/postgres/internal/store"
 )
 
 const defaultDatabaseURL = "postgres://readiness_app:readiness-app-local-only@127.0.0.1:55432/readiness?sslmode=disable"

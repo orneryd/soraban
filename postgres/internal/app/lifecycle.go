@@ -228,6 +228,7 @@ type BatchWork struct {
 	FirmID        string
 	ClientID      string
 	TaxYear       int
+	AttemptCount  int
 	NextAction    BatchAction
 	UTID          string
 	CanonicalXML  []byte

@@ -96,14 +96,14 @@ before adapters start.
 | `IRS_BEARER_TOKEN`             | `local-irs-token`                                  | `worker`          |
 | `HTTP_ADDR`                    | `127.0.0.1:8080`                                   | `serve`           |
 | `WORKER_IDLE_DELAY`            | `1s`                                               | `worker`          |
-| `WORKER_LEASE_DURATION`        | `30s`                                              | `worker`          |
+| `WORKER_LEASE_DURATION`        | `90s`                                              | `worker`          |
 | `HTTP_CONNECT_TIMEOUT`         | `3s`                                               | `worker`          |
 | `HTTP_RESPONSE_HEADER_TIMEOUT` | `5s`                                               | `worker`          |
 | `HTTP_TOTAL_TIMEOUT`           | `10s`                                              | `worker`          |
 | `SHUTDOWN_TIMEOUT`             | `15s`                                              | `worker`, `serve` |
 
-The lease duration MUST exceed the total HTTP timeout plus a bounded persistence
-margin. Secrets MUST come from environment or an injected configuration source,
+The lease duration MUST exceed the 60-second conservative rate-fence wait plus
+the total HTTP timeout and a bounded persistence margin. Secrets MUST come from environment or an injected configuration source,
 not flags, URLs, logs, or committed files.
 
 ### 4.3 Composition
@@ -118,6 +118,25 @@ Startup MUST:
 6. start only the requested command.
 
 The service MUST NOT apply database migrations automatically.
+
+### 4.4 Local commands
+
+From `service/`, with the documented PostgreSQL container running:
+
+```sh
+make build
+make test
+make test-race
+make test-e2e
+make test-live
+make test-crash
+```
+
+`make test-e2e` creates and removes a disposable database while consuming both
+checked-in exports. `make test-live` uses the running IRS stub at
+`http://127.0.0.1:8081`. `make test-crash` starts a dedicated deterministic
+after-record stub and takes about two minutes because it honors two conservative
+60-second crash fences.
 
 ## 5. Import adapter
 
